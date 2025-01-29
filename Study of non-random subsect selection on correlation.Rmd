@@ -1,0 +1,729 @@
+---
+title: "Analysis of correlation effects of non-random data choice"
+author: "Ema Mombrini"
+date: "`r Sys.Date()`"
+output: html_document
+format: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Introduction
+
+This script analyses what is the effect of choosing a subsect of events from a drought index series in order to perform an interview on drought impacts. The analysis is conducted by creating a synthetic distribution with a known correlation and studying the effect of the choice of events and possible unbiasing methods (e.g. through imputation).
+
+The choice of certain number of events is dictated by the need to ask the interviewee about 8 or so periods indicated by a designated normalized drought indicator, finding if they where seen as drought periods as well as how severe they were compared to other drought periods. Given that often more than 30 drought events can be present in the normalized series, a choice of events is needed to effectively conduct the interview. Given that correlation between the ranking of drought events obtained from the indices and the percieved severity ranking of drought events is of interest, possible bias introduced by this procedure is studied in this script.
+
+## Synthetic dataset creation
+
+A synthetic dataset of events is created in order to study many possible cases. The dataset is created through the definition of an appropriate distribution choice and by imposing certain threshold to model the detection of drought periods as such. The dataset creation is based on the hypothesis that drought periods are evaluated by professionals as more/less severe according to an implicit categorization which, while perhaps based on a multitude of inputs and parameters, can be represented as a monodimensional magnitude value, say $\chi_{P}$. Furthermore, the classification is assumed to have a lower threshold, according to which events under a certain severity are not perceived as drought periods. Finally, it is hypothesized that this implicit ranking bears some correlation with a ranking based on characteristics of drought periods as defined through a normalized index (e.g. SPI, SPEI, SSI) and analyzed through run theory. As such, a composite monodimensional $\chi_{I}$ value is calculated for each event of an index series.
+
+Given that $\chi_{P}$ is unknown, for the study of this problem it is synthetically obtained from a distribution, which is defined based on the distribution of $\chi_{I}$ values obtained from a known index series, assuming the previously stated hypothesis. As such, we must first find a suitable distribution for the $\chi$ magnitude values.
+
+### Choice of drought "magnitude" distribution
+
+Run analysis of normalized index series usually involves the definition of drought periods ar "runs" under a certain threshold (e.g. -1). For each of these runs, the subsequent values are usually defined in the literature:
+
+-   Drought Severity (DS): sum of the index value during the run.
+
+-   Drought Duration (DD): length (in months) of the run.
+
+-   Drought Intensity (DI): DS divided by DD, representing the mean index value during the run.
+
+    ![Figure 1: example of drought run characteristics.](images/Drought%20run%20explanation_alt.png){width="700"}
+
+Given the need for a single "magnitude" value to compare to the hypothesized one for the interviewee, two of these characteristics need to be combined into a single value (given that one of the three is just derived from the other two). The choice is made to rank events based on a multivariate ranking obtained from DD and DI, given that DD and DS are positively correlated as DS is a monotonic increasing function. Both DD and DI values a normalized via a simple linear normalization from 0 to 1 (respectively the minimum and maximum DD and DI values in the dataset) and summed together to obtain a $\chi_{P}$ value.
+
+For example, this ranking procedure is done on an SPI series from the study area.
+
+```{r drought_index_calculation_and_run_analysis, echo=FALSE}
+#Script to rank drought periods in a multivariate way based on both duration and severity
+pacman::p_load(pacman, SPEI, tidyverse, tidyterra, terra, stars, ggplot2, MASS)
+
+#Load precipitation data and basins shapefiles
+{
+  prec <- read_stars("/home/admin/Desktop/Research/ATO4Water/Progetti R/R Index Analysis/NWIOIprecDAY.nc")
+  
+  #Change the name of the NWIOIprecDAY attribute
+  attributes(prec)$names <- "Prec"
+  
+  #Define reference system
+  crs <- st_crs('EPSG:4326')
+  prec <- st_set_crs(prec, crs)
+  
+  #Aggregate on monthly scale
+  prec <- aggregate(prec, by="months", FUN=sum)
+  prec <- aperm(prec, c(2,3,1)) #Change dimensions back to x,y,time
+  
+  #Time vector
+  t <- time(prec)
+  
+  #Basins in the Cuneo region
+  basins <- vect("/home/admin/OneDrive/ATO4Water/Mappe/bacini_Luca.shp")
+  basins <- project(basins, "EPSG:4326")
+  
+  #Sort in decreasing area order
+  basins <- basins[order(basins$area, decreasing = TRUE)]
+}
+
+#Choose the basin(s) of interest
+basin_name <- "BANSA"
+basins <- filter(basins, codice==basin_name)
+
+#Calculate the SPI of choice for the basin
+{
+  #Extract the precipitation values for the basin
+  prec_basin <- extract(as(prec, "SpatRaster"), basins, mean, exact=TRUE)
+  
+  #Reformat results as data frame with time series for each basin
+  drought_ind <- data.table::transpose(prec_basin[,2:dim(prec_basin)[2]])
+  names(drought_ind) <- basins$codice
+  
+  drought_ind[,] <- apply(drought_ind, 2, function(x) spi(ts(x,
+                              start = c(year(t[1]),month(t[1])),
+                              frequency = 12),
+                              3, ##Time scale
+                              na.rm = TRUE,
+                              verbose = FALSE)$fitted)
+  
+  #Remove attributes for further calculation
+  attr(drought_ind[,], "dimnames") <- NULL
+  
+  #Format dataframe
+  drought_ind$Date <- as_date(t)
+  names(drought_ind)[1] <- "SPI"
+  
+  #Remove missing values
+  drought_ind <- drought_ind[!is.na(drought_ind$SPI),]
+}
+
+#Plot figure
+{
+  ggplot(drought_ind, aes(x = Date, y = SPI, fill = SPI)) +
+    geom_col(group = 1, show.legend = FALSE) +
+    scale_fill_stepsn(breaks = c(0),
+                      colours = c("red", "blue"))+
+    labs(x = "",
+         y = "SSI") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    scale_x_date(date_labels = "%Y")
+}
+
+#Run analysis on the series, including onset and offset (months below zero before
+#and after the period under the threshold). Based on script by Benedetta Rivella
+{
+  #Initialise a data frame indicating if runs are occurring (T/F)
+  runs <- drought_ind[,1]
+  runs[,] <- FALSE
+  
+  #Define threshold
+  thr <- -1
+  
+  #For cycle calculating (for all basins) if a run is occurring
+  for(i in 1:ncol(runs)){
+    for (j in 1:nrow(runs)) {
+      #Check if current month is under the -1 threshold
+      if (!is.na(drought_ind[j,i]) && drought_ind[j,i] <= thr) {
+        runs[j,i] <- TRUE
+        
+        #Check previous months
+        for (k in (j-1):1) {
+          if (is.na(drought_ind[k,i]) || drought_ind[k,i] > 0 || runs[k,i]) {
+            break
+          }
+        }
+        
+        runs[(k+1):j,i] <- TRUE
+        
+        #Check following months
+        for (k in (j+1):nrow(drought_ind)) {
+          if (k>nrow(drought_ind) || is.na(drought_ind[k,i]) || 
+              drought_ind[k,i] > 0 || drought_ind[k,i] <= -1) {
+            break
+          }
+        }
+        
+        runs[j:(k-1),i] <- TRUE
+      }
+    }
+  }
+}
+
+#Calculate the drought period's characteristics. Based on script by Benedetta Rivella
+{
+  #Create a list to store all the data frames of drought period's characteristics
+  drought_periods <- vector(mode = "list", length = ncol(drought_ind)-1)
+  names(drought_periods) <- names(drought_ind)[1]
+  
+  for(i in 1:(ncol(drought_ind)-1)){
+    #Initialize a dataframe for the drought periods
+    drought_period_loc <-data.frame(
+      Start = POSIXct(),
+      End = POSIXct(),
+      Severity = numeric(),
+      Duration = numeric(),
+      Intensity = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    #Calculate the start/end and the duration
+    run_ongoing <- FALSE
+    
+    for (j in 1:nrow(runs)) {
+      if (runs[j,i] && !run_ongoing) {
+        run_ongoing <- TRUE
+        Start <- t[j]
+        Severity <- drought_ind[j,i]
+        Duration <- 1
+      } else if ((!runs[j,i] && run_ongoing) || (j==nrow(runs) && run_ongoing)) {
+        run_ongoing <- FALSE
+        End <- t[j-1]
+        drought_period_loc <- rbind(drought_period_loc,
+                                    data.frame(Start = Start,
+                                               End = End,
+                                               Severity = Severity,
+                                               Duration = Duration))
+      } else if (runs[j,i] && run_ongoing) {
+        Severity <- Severity + drought_ind[j,i]
+        Duration <- Duration + 1
+      }
+    }
+    
+    drought_period_loc$Intensity <- drought_period_loc$Severity/drought_period_loc$Duration
+    
+    #Put the dataframe of drought events in the list
+    drought_periods[[i]] <- drought_period_loc
+  }
+  
+  # Remove useless data
+  rm(basins, crs, drought_ind, drought_period_loc, prec, prec_basin, runs, Severity,
+     basin_name, Duration, End, i, j, k, run_ongoing, Start, t, thr)
+}
+```
+
+The obtained events display the following distribution of the $\chi_{I}$ value:
+
+```{r multivariate_ranking_of_drought_periods_ex, echo=FALSE}
+# Normalize Duration and Severity between 1 and 10
+drought_periods <- drought_periods[[1]]
+drought_periods <- drought_periods %>%
+  mutate(
+    Intensity_norm = scales::rescale(Intensity, to = c(0, 1)),
+    Severity_norm = scales::rescale(Severity, to = c(0, 1)),
+    Duration_norm = scales::rescale(Duration, to = c(0, 1))
+  )
+
+# Sum of normalized Duration and Severity values to obtain a score
+drought_periods <- drought_periods %>%
+  mutate(
+    Int_Dur = Intensity_norm + Duration_norm,
+    Int_Sev = Intensity_norm + Severity_norm,
+    Dur_Sev = Severity_norm + Duration_norm
+  )
+
+# Order events based on score (top to bottom) and create ranking
+drought_periods <- drought_periods %>%
+  arrange(desc(Int_Dur)) %>%
+  mutate(Rank = row_number())
+
+# Create Date interval
+drought_periods$Date_Range <- paste(format(drought_periods$Start, "%b %Y"), 
+                           "-", 
+                           format(drought_periods$End, "%b %Y"))
+
+# top_8_drought_periods_Severity_Intensity <- drought_periods %>%
+#   filter(Rank <= 8)
+
+# top_8_drought_periods_Duration_Severity <- drought_periods %>%
+#   filter(Rank <= 8)
+
+# Create interactive graph
+p_load(plotly)
+fig <- plot_ly(drought_periods, 
+               x = ~Intensity, 
+               y = ~Duration, 
+               type = 'scatter', 
+               mode = 'markers',
+               text = ~paste("Event: ", Rank, "<br>Start date: ", Date_Range), # Testo per tooltip
+               hoverinfo = 'text',  
+               marker = list(size = 8)) %>%
+  layout(title = "Interactive Graph: Intensity vs Duration of events",
+         xaxis = list(title = "Intensity"),
+         yaxis = list(title = "Duration"))
+
+fig
+
+#Plot distribution of the events
+p_load(fitdistrplus)
+
+plot(ecdf(drought_periods$Int_Dur), main = "Ecdf of magnitude values")
+```
+
+The obtained values follow quite closely a normal distribution.
+
+```{r magnitude_values_distribution, echo=FALSE, warning=FALSE, message=FALSE}
+descdist(drought_periods$Int_Dur)
+
+distr_index <- fitdist(drought_periods$Int_Dur, "norm")
+
+plot(distr_index)
+```
+
+The fitted distribution is used for the definition of both the $\chi{I}$ and $\chi{P}$ values.
+
+### Definition of a bivariate distribution of magnitude values
+
+The magnitude values from the index series and from the interviewee are simulated as a bivariate normal distribution, where both distributions have the same parameters (given that they are obtained from normalized data).
+
+```{r bivariate_distributions_example, echo=FALSE, results = "hide", warning=FALSE, message=FALSE}
+#Display a series of bivariate distributions with different correlation values
+p_load(MASS, ggdensity, ggpubr, egg)
+
+#Define the correlations to display
+corr_fig <- seq(from = 0.2, to = 0.9, by = 0.1)
+
+#Create plots to display
+fig <- vector(mode = "list", length =  length(corr_fig))
+for(i in 1:length(corr_fig)){
+  mean <- rep(distr_index$estimate[1],2)
+  sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2), 2)
+  
+  bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma ) # from MASS package
+  bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+  
+  # cor.test(bvnorm$x,bvnorm$y, method = "spearman")
+    fig[[i]] <- ggplot(bvnorm, aes(x = x, y = y))+
+      # geom_density_2d()+
+      geom_hdr_lines()+
+      stat_ellipse(type = "norm", colour="red")+
+      geom_point()+
+      stat_cor(method = "spearman", cor.coef.name = "rho")+
+      labs(title = sprintf("Correlation = %.2f", corr_fig[i]))
+      
+}
+
+ggpubr::ggarrange(plotlist = fig, ncol=2)
+```
+
+## Simulation of responses
+
+### Exclusion of interviewee responses
+
+The interview process is simulated by calculating first eliminating all events under a certain $\chi{P}$ threshold for the interviewee, simulating the inability to remember events with lower than average characteristics.
+
+```{r example_thr_reponses, echo=FALSE, results = "hide", warning=FALSE, message = FALSE}
+corr_fig <- 0.6
+sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig,
+                    distr_index$estimate[2]^2*corr_fig,
+                    distr_index$estimate[2]^2), 2)
+  
+  bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma ) # from MASS package
+  bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+  
+  #Simulate threshold
+  bvnorm$Threshold <- rep("Under", length(bvnorm$x))
+  bvnorm$Threshold[bvnorm$y>distr_index$estimate[1]] <- "Over"
+  
+  # cor.test(bvnorm$x,bvnorm$y, method = "spearman")
+  ggplot(bvnorm, aes(x = x, y = y))+
+      # geom_density_2d()+
+      geom_hdr_lines()+
+      stat_ellipse(type = "norm", colour="red")+
+      stat_cor(method = "spearman", cor.coef.name = "rho")+
+      geom_hline(yintercept = distr_index$estimate[1], linetype = "dashed")+
+      geom_point(aes(x = x, y = y, color=Threshold))+
+      labs(title = sprintf("Correlation = %.2f", corr_fig))
+
+```
+
+This also excludes a certain number of ranks which the interviewee will not remember.
+
+```{r example_thr_reponses_rank, echo=FALSE, results = "hide", warning=FALSE, message = FALSE}
+p_load(grid)
+
+#Calculate ranks
+bvnorm$x_r <- rank(-bvnorm$x)
+bvnorm$y_r <- rank(-bvnorm$y)
+
+#Plots ranks and information
+annotation <- grobTree(textGrob(
+  sprintf("Max Ranks: %g (Interviewer), %g (Interviewee)",
+          max(bvnorm$x_r[bvnorm$Threshold == "Over"]),
+          max(bvnorm$y_r[bvnorm$Threshold == "Over"])),
+  x=0.05,  y=0.05, hjust=0,
+  gp=gpar(fontsize=11)))
+
+ggplot(bvnorm, aes(x = x_r, y = y_r, color = Threshold))+
+      stat_cor(method = "spearman", cor.coef.name = "rho")+
+      geom_point(aes(x = x_r, y = y_r, color=Threshold))+
+      labs(title = sprintf("Correlation = %.2f", corr_fig))+
+  xlab("Ranks for interviewer")+
+  ylab("Ranks for interviewee")+
+  annotation_custom(annotation)
+
+```
+
+### Exclusion for questions
+
+As said before, a number of responses must be excluded in order to be able to conduct the interview. For now these are assumed to be 10 events, chosen as the top 10 from the ranking of $\chi{I}$ values. This further restricts the number of asked events.
+
+```{r question_exclusion_ex, echo=FALSE, results = "hide", warning=FALSE, message = FALSE}
+
+bvnorm <- bvnorm[bvnorm$Threshold == "Over", ]
+bvnorm$Interview <- rep("Not asked", length(bvnorm$x))
+
+bvnorm$Interview[bvnorm$x_r<=10] <- "Asked"
+
+ggplot(bvnorm, aes(x = x_r, y = y_r, color = Interview, shape = Threshold))+
+      stat_cor(method = "spearman", cor.coef.name = "rho")+
+      geom_point()+
+      labs(title = sprintf("Correlation = %.2f", corr_fig))+
+  geom_vline(xintercept = 10, linetype = "dashed")+
+  xlab("Ranks for interviewer")+
+  ylab("Ranks for interviewee")
+```
+
+As can be seen already from the examples, such a procedure is likely to not result in a significant correlation value to be obtained, especially if we assume mid-low correlation over the whole dataset.
+
+### Empirical correlation
+
+The effects on the non-random choice procedure on data with different underlying correlations are show by plotting the resulting distributions of empirical correlations and their (non) significance.
+
+```{r display_empirical_correlation, echo=FALSE, results = "hide", warning=FALSE, message = FALSE}
+#| column: screen
+#| out-width: 80%
+#| fig-format: svg
+p_load(ggdensity, ggpubr)
+
+#Define the correlations to display
+corr_fig <- seq(from = 0.2, to = 0.9, by = 0.1)
+
+#Create plots to display
+fig <- vector(mode = "list", length =  length(corr_fig))
+
+n_sim <- 1e4
+for(i in 1:length(corr_fig)){
+  mean <- rep(distr_index$estimate[1],2)
+  sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2), 2)
+  
+  
+  #Simulate a certain number of interview
+  int_sim <- data.frame("Correlation" = rep(NA, n_sim),
+                        "p-value" = rep(NA, n_sim))
+  for(j in 1:n_sim){
+    #Random values from bivariate distribution
+    bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma )
+    bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+    
+    #Ranking
+    bvnorm$x_r <- rank(-bvnorm$x)
+    bvnorm$y_r <- rank(-bvnorm$y)
+    
+    #Remove values under threshold and non-asked events
+    bvnorm <- bvnorm[bvnorm$y>distr_index$estimate[1],]
+    bvnorm <- bvnorm[bvnorm$x_r<10,]
+    
+    corr_temp <- tryCatch({cor.test(bvnorm$x_r, bvnorm$y_r)},
+                          error = function(e){
+                            data.frame("estimate"=NA,"p.value"=1)
+                          })
+    
+    int_sim$Correlation[j] <- corr_temp$estimate
+    int_sim$p.value[j] <- corr_temp$p.value
+  }
+  
+  int_sim$Significance <- rep(FALSE, n_sim)
+  int_sim$Significance[int_sim$p.value<=0.05] <- TRUE
+  
+  annotation <- grobTree(textGrob(
+  sprintf("Mean sign. corr.: %g
+Perc. Rejected: %g",
+          mean(int_sim$Correlation[int_sim$p.value<=0.05 & 
+                                     !is.na(int_sim$Correlation)]),
+          sum(int_sim$p.value>0.05)/n_sim*100),
+  x=0.05,  y=0.9, hjust=0,
+  gp=gpar(fontsize=11)))
+
+    fig[[i]] <- ggplot(int_sim, aes(x = Correlation, fill="All"))+
+      geom_density(alpha=0.4)+
+      geom_vline(xintercept = corr_fig[i], linetype = "dashed")+
+      geom_density(alpha=0.4, aes(x = Correlation, fill = Significance))+
+      annotation_custom(annotation)+
+      labs(title = sprintf("Correlation = %.2f", corr_fig[i]),
+           fill = "Significant")
+}
+
+ggpubr::ggarrange(plotlist = fig, ncol=2)
+```
+
+The distributions clearly show that the procedure makes it very difficult to obtain a significant value from the test, and even then the value obtained is not close to the actual one.
+
+### Imputation
+
+Different imputation methods are proposed and tested. These consist of substituting the missing (non-asked) values with different methods in order to better represent the entire dataset.
+
+#### Median value substitution
+
+The median value of the interviewer's and interviewee's rankings, respectively, is substituted for all missing values.
+
+```{r median_substitution, echo=FALSE, results = "hide", warning=FALSE, message = FALSE}
+#| column: screen
+#| out-width: 80%
+#| fig-format: svg
+p_load(ggdensity, ggpubr)
+
+#Define the correlations to display
+corr_fig <- seq(from = 0.2, to = 0.9, by = 0.1)
+
+#Create plots to display
+fig <- vector(mode = "list", length =  length(corr_fig))
+
+n_sim <- 1e4
+for(i in 1:length(corr_fig)){
+  mean <- rep(distr_index$estimate[1],2)
+  sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2), 2)
+  
+  
+  #Simulate a certain number of interview
+  int_sim <- data.frame("Correlation" = rep(NA, n_sim),
+                        "p-value" = rep(NA, n_sim))
+  for(j in 1:n_sim){
+    #Random values from bivariate distribution
+    bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma )
+    bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+    
+    #Ranking
+    bvnorm$x_r <- rank(-bvnorm$x)
+    bvnorm$y_r <- rank(-bvnorm$y)
+    
+    #Remove values under threshold and non-asked events
+    bvnorm[bvnorm$y<distr_index$estimate[1] | bvnorm$x_r >10,] <- NA
+    
+    #Imputation through median values
+    bvnorm$x_r[is.na(bvnorm$x_r)] <- median(bvnorm$x_r[!is.na(bvnorm$x_r)])
+    bvnorm$y_r[is.na(bvnorm$y_r)] <- median(bvnorm$y_r[!is.na(bvnorm$y_r)])
+    
+    corr_temp <- tryCatch({cor.test(bvnorm$x_r, bvnorm$y_r)},
+                          error = function(e){
+                            data.frame("estimate"=NA,"p.value"=1)
+                          })
+    
+    int_sim$Correlation[j] <- corr_temp$estimate
+    int_sim$p.value[j] <- corr_temp$p.value
+  }
+  
+  int_sim$Significance <- rep(FALSE, n_sim)
+  int_sim$Significance[int_sim$p.value<=0.05] <- TRUE
+  
+  int_sim$p.value[is.na(int_sim$p.value)] <- 1
+  annotation <- grobTree(textGrob(
+  sprintf("Mean sign. corr.: %g
+Perc. Rejected: %g",
+          mean(int_sim$Correlation[int_sim$p.value<=0.05], na.rm = TRUE),
+          sum(int_sim$p.value>0.05, na.rm = TRUE)/n_sim*100),
+  x=0.05,  y=0.9, hjust=0,
+  gp=gpar(fontsize=11)))
+
+    fig[[i]] <- ggplot(int_sim, aes(x = Correlation, fill="All"))+
+      geom_density(alpha=0.4)+
+      geom_vline(xintercept = corr_fig[i], linetype = "dashed")+
+      geom_density(alpha=0.4, aes(x = Correlation, fill = Significance))+
+      annotation_custom(annotation)+
+      labs(title = sprintf("Correlation = %.2f", corr_fig[i]),
+           fill = "Significant")
+}
+
+ggpubr::ggarrange(plotlist = fig, ncol=2)
+
+```
+
+#### Bayesian Approach
+
+Next, imputation is made via a Bayesian approach by reconstructing the missing values based on the Multivariate Imputation by Chained Equations. First, an example is given: the imputation is performed by using a bayesian linear regression and then doing a post processing on the data, "filling" in the missing ranks from the interview. From these imputed values a correlation and p-value is calculated.
+
+```{r bayesian_correlation_test, results = "hide", warning=FALSE, message = FALSE}
+p_load(mice, brms, miceadds, ggmice)
+#Example of the bayesian approach
+#First, construct a questions/answers dataframe
+
+corr_fig <- 0.7
+
+mean <- rep(distr_index$estimate[1],2)
+sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig,
+                    distr_index$estimate[2]^2*corr_fig,
+                    distr_index$estimate[2]^2), 2)
+
+#Random values from bivariate distribution
+bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma )
+bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+
+#Ranking
+bvnorm$x_r <- rank(-bvnorm$x)
+bvnorm$y_r <- rank(-bvnorm$y)
+
+#Remove values under threshold and non-asked events
+bvnorm[bvnorm$y<distr_index$estimate[1] | bvnorm$x_r >10,4] <- NA
+
+#Remove the chiP values as they are not known
+bvnorm <- bvnorm[,c(1,3,4)]
+
+#Exclude the interviwere's ranks from imputer variables
+pred_matr <- matrix(data = rep(1,ncol(bvnorm)^2), ncol = ncol(bvnorm))
+diag(pred_matr) <- 0
+pred_matr[,2] <- 0
+
+#Create imputed datasets via the mice package
+imp <- mice(bvnorm, m = 10, method = "norm", predictorMatrix = pred_matr)
+stripplot(imp)
+
+# #Post-processing 1: all y_r values should be between 1 and the number of events
+post <- imp$post
+# post["y_r"] <- "imp[[j]][, i] <- squeeze(imp[[j]][, i], c(1, max(bvnorm$x_r)))"
+# imp <- mice(bvnorm, m = 20, method = "norm", predictorMatrix = pred_matr,
+#             post = post)
+# stripplot(imp)
+# 
+# corr_imp <- micombine.cor(mi.res=imp, variables = c(2,3),
+#                           method="pearson",
+#                           conf.level = 0.95)
+#Post processing 2: all events are round numbers filling the missing ranks in the interviewee's response
+missing_ranks <- 1:length(bvnorm$y_r)
+missing_ranks <- missing_ranks[-bvnorm$y_r[!is.na(bvnorm$y_r)]]
+
+post["y_r"] <- "imp[[j]][, i] <- missing_ranks[rank(-imp[[j]][, i], ties.method = c('last'))]"
+imp <- mice(bvnorm, m = 10, method = "norm", predictorMatrix = pred_matr,
+            post = post)
+stripplot(imp)
+
+#Plot correlation
+post["y_r"] <- "imp[[j]][, i] <- missing_ranks[rank(imp[[j]][, i], ties.method = c('first'))]"
+imp <- mice(bvnorm, m = 500, method = "norm", predictorMatrix = pred_matr,
+            post = post)
+
+corr_imp <- micombine.cor(mi.res=imp, variables = c(2,3),
+                          method="pearson",
+                          conf.level = 0.95)
+annotation <- grobTree(textGrob(
+  sprintf("Corr.: %g
+Emp. Corr. (no imp.): %g (p: %g)
+Emp. Corr. (imp.): %g (p: %g)",
+          corr_fig,
+          cor.test(bvnorm$x_r,bvnorm$y_r)$estimate,
+          cor.test(bvnorm$x_r,bvnorm$y_r)$p.value,
+          corr_imp$r[1],
+          corr_imp$p[1]),
+  x=0.05,  y=0.9, hjust=0,
+  gp=gpar(fontsize=11)))
+
+ggmice(imp, aes(x = x_r, y = y_r))+
+  geom_point()+
+  geom_smooth(aes(colour=""),method='lm')+
+  labs(title = sprintf("Corr.: %.2g
+Emp. Corr. (no imp.): %.2g (p: %.2g)
+Emp. Corr. (imp.): %.2g (p: %.2g)",
+          corr_fig,
+          cor.test(bvnorm$x_r,bvnorm$y_r)$estimate,
+          cor.test(bvnorm$x_r,bvnorm$y_r)$p.value,
+          corr_imp$r[1],
+          corr_imp$p[1]))+
+  xlab("Ranks for interviewer")+
+  ylab("Ranks for interviewee")
+```
+
+Next, the results from a number of iterations using this method are presented.
+
+```{r mice_correlation_distr, results = "hide", warning=FALSE, message = FALSE}
+
+#Define the correlations to display
+corr_fig <- seq(from = 0.2, to = 0.9, by = 0.1)
+
+#Exclude the interviwere's ranks from imputer variables
+pred_matr <- matrix(data = rep(1,ncol(bvnorm)^2), ncol = ncol(bvnorm))
+diag(pred_matr) <- 0
+pred_matr[,2] <- 0
+
+#Create plots to display
+fig <- vector(mode = "list", length =  length(corr_fig))
+
+n_sim <- 1e3
+for(i in 1:length(corr_fig)){
+  mean <- rep(distr_index$estimate[1],2)
+  sigma <- matrix(c(distr_index$estimate[2]^2,
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2*corr_fig[i],
+                    distr_index$estimate[2]^2), 2)
+  
+  
+  #Simulate a certain number of interview
+  int_sim <- data.frame("Correlation" = rep(NA, n_sim),
+                        "p-value" = rep(NA, n_sim))
+  for(j in 1:n_sim){
+    #Random values from bivariate distribution
+    bvnorm <- mvrnorm(dim(drought_periods)[1], mu = mean, Sigma = sigma )
+    bvnorm <- data.frame(x = bvnorm[,1], y = bvnorm[,2])
+    
+    #Ranking
+    bvnorm$x_r <- rank(-bvnorm$x)
+    bvnorm$y_r <- rank(-bvnorm$y)
+    
+    #Remove chi_p values
+    bvnorm <- bvnorm[,-2]
+    
+    #Remove values under threshold and non-asked events
+    bvnorm$y_r[bvnorm$y<distr_index$estimate[1] | bvnorm$x_r >10] <- NA
+    
+    #Imputation through mice
+    imp <- mice(bvnorm, m=1, maxit=1)
+    post <- imp$post
+    
+    post["y_r"] <- "imp[[j]][, i] <- missing_ranks[rank(imp[[j]][, i],ties.method = c('first'))]"
+    imp <- mice(bvnorm, m = 100, method = "norm", predictorMatrix = pred_matr,
+                post = post, maxit=1, print=FALSE, n.cores=6)
+    
+    corr_imp <- micombine.cor(mi.res=imp, variables = c(2,3),
+                              method="pearson",
+                            conf.level = 0.95)
+    
+    int_sim$Correlation[j] <- corr_imp$r[1]
+    int_sim$p.value[j] <- corr_imp$p[1]
+    
+    print(c(j,i))
+  }
+  
+  int_sim$Significance <- rep(FALSE, n_sim)
+  int_sim$Significance[int_sim$p.value<=0.05] <- TRUE
+  
+  int_sim$p.value[is.na(int_sim$p.value)] <- 1
+  annotation <- grobTree(textGrob(
+  sprintf("Mean sign. corr.: %g
+Perc. Rejected: %g",
+          mean(int_sim$Correlation[int_sim$p.value<=0.05], na.rm = TRUE),
+          sum(int_sim$p.value>0.05, na.rm = TRUE)/n_sim*100),
+  x=0.05,  y=0.9, hjust=0,
+  gp=gpar(fontsize=11)))
+
+    fig[[i]] <- ggplot(int_sim, aes(x = Correlation, fill="All"))+
+      geom_density(alpha=0.4)+
+      geom_vline(xintercept = corr_fig[i], linetype = "dashed")+
+      geom_density(alpha=0.4, aes(x = Correlation, fill = Significance))+
+      annotation_custom(annotation)+
+      labs(title = sprintf("Correlation = %.2f", corr_fig[i]),
+           fill = "Significant")
+}
+
+ggpubr::ggarrange(plotlist = fig, ncol=2)
+```
